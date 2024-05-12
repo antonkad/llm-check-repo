@@ -4,6 +4,7 @@ import shutil
 import os
 import asyncio
 import uuid
+import logging
 
 import subprocess
 from pydantic import BaseModel
@@ -12,6 +13,8 @@ from langchain_groq import ChatGroq
 from fastapi import FastAPI, HTTPException, Body
 
 app = FastAPI()
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class GitRepoRequest(BaseModel):
     repo_url: str
@@ -29,8 +32,11 @@ async def detect_repo(request: GitRepoRequest = Body(...)):
         data = git_ls_tree_remote(request.repo_url, request.ref, request.commit, request.mono_path)
         assessment = assess_repo(data)
         return assessment
+    except HTTPException as http_ex:
+        raise http_ex
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        logging.error(f"Unhandled error in detect_repo: {e}")
+        raise HTTPException(status_code=400, detail=f"Error in processing the request: {str(e)}")
     
 def remove_cloned_repo(repo_path: str):
     """
@@ -39,61 +45,58 @@ def remove_cloned_repo(repo_path: str):
     Args:
     repo_path (str): The path to the directory to remove.
     """
-    # Ensure the directory exists before attempting to remove it
     if os.path.exists(repo_path):
-        shutil.rmtree(repo_path)
-        print(f"Removed directory {repo_path}")
+        try:
+            shutil.rmtree(repo_path)
+            logging.info(f"Removed directory {repo_path}")
+        except Exception as e:
+            logging.error(f"Failed to remove directory {repo_path}: {e}")
     else:
-        print(f"Directory {repo_path} does not exist")
+        logging.warning(f"Directory {repo_path} does not exist")
 
 def git_ls_tree_remote(repo_url: str, ref: str, commit: str | None = None, mono_path: str | None = None):
+    
     # Extract the repository name from the URL
     repo_name = repo_url.split('/')[-1].split('.')[0]
     unique_id = uuid.uuid4()
     repo_path = f"./{repo_name}_{unique_id}"  # Path where the repo is cloned
+    commands_executed = []  # List to hold commands executed
 
     try:
-        # Extract the repository name from the URL
-        repo_name = repo_url.split('/')[-1].split('.')[0]
-
        # Clone the repository into the specified directory without checking out the files, only the latest commit
-        clone_process = subprocess.run(
-            f'git clone --no-checkout --depth 1 {repo_url} "{repo_path}"',
-            shell=True,
-            capture_output=True
-        )
+        try:
+            clone_command = f'git clone --no-checkout --depth 1 {repo_url} "{repo_path}" --branch {ref}'
+            commands_executed.append(clone_command)
+            subprocess.run(
+                clone_command,
+                shell=True,
+                check=True,
+                capture_output=True
+            )
 
-        if clone_process.returncode != 0:
-            raise Exception("Error cloning repository: " + clone_process.stderr.decode())
+            mono_path = f"{mono_path}/" if mono_path and not mono_path.endswith("/") else mono_path
+            ls_command = f'git ls-tree --full-name --name-only {commit or ref} {mono_path}'
+            commands_executed.append(ls_command)
+            ls_result = subprocess.run(ls_command, shell=True, cwd=repo_path, capture_output=True, text=True, check=True)
 
-        cd_process = subprocess.run(f'cd {repo_path}', shell=True, capture_output=True, text=True)
+            if 'package.json' in ls_result.stdout:
+                show_command = f'git show {commit or ref}:{mono_path}package.json'
+                commands_executed.append(show_command)
+                show_result = subprocess.run(show_command, shell=True, cwd=repo_path, capture_output=True, text=True, check=True)
+                return ls_result.stdout + '\n' + show_result.stdout
 
-        if cd_process.returncode != 0:
-            raise Exception("Error listing files: " + cd_process.stderr)
-        
-        if mono_path:
-            if not mono_path.endswith("/"):
-                mono_path += "/"
+            return ls_result.stdout
 
-        # List the files based on commit or ref
-        result = subprocess.run(f'git ls-tree --full-name --name-only {commit or ref} {mono_path}', shell=True, cwd=repo_path, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            # Log all commands executed before the error
+            logging.error(f"Command executed:")
+            for cmd in commands_executed:
+                logging.error(f"{cmd}")
+            logging.error(f"Error executing command. Last error: {e.stderr}")
+            raise HTTPException(status_code=500, detail=f"Error executing command: {e.stderr}")
 
-        if result.returncode != 0:
-            raise Exception("Error listing files: " + result.stderr)
-
-        # Check if package.json exists in the output
-        if 'package.json' in result.stdout:
-            # Execute git show <ref or commit>:package.json
-            show_process = subprocess.run(f'git show {commit or ref}:{mono_path}package.json', shell=True, cwd=repo_path, capture_output=True, text=True)
-            if show_process.returncode != 0:
-                raise Exception("Error listing files: " + show_process.stderr)
-            else:
-                return result.stdout + '\n' + show_process.stdout
-
-        else:
-            return result.stdout
     finally:
-        remove_cloned_repo(repo_path)
+        subprocess.run(f'rm -rf "{repo_path}"', shell=True)
 
 def assess_repo(data: str):
     groq_api_key = os.getenv('GROQ_API_KEY')
